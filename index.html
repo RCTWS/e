@@ -1,38 +1,71 @@
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    
-    // دوال مساعدة للتحقق من الصلاحيات عبر الـ Custom Claims
-    function isSuperAdmin() {
-      return request.auth != null && request.auth.token.email == "q@q.com";
-    }
-    
-    function isAdmin() {
-      return request.auth != null && request.auth.token.role == "admin";
-    }
-    
-    function isNormalUser() {
-      return request.auth != null && request.auth.token.role == "user";
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+admin.initializeApp();
+
+const SUPER_ADMIN_EMAIL = "q@q.com";
+
+// دالة إنشاء مستخدم جديد وتعيين الصلاحيات (Custom Claims)
+exports.createUserAccount = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من هوية المرسل (يجب أن يكون Super Admin)
+    if (!context.auth || context.auth.token.email !== SUPER_ADMIN_EMAIL) {
+        throw new functions.https.HttpsError("permission-denied", "فقط الحساب الرئيسي (Super Admin) يملك هذه الصلاحية.");
     }
 
-    // 1. قواعد مسارات بيانات الإزالات (Records)
-    match /artifacts/nile-removal-project-default/public/data/records/{recordId} {
-      // السماح للقراءة: الأدمن والمدير يقرأون كل شيء. المستخدم يقرأ بياناته فقط.
-      allow read: if isSuperAdmin() || isAdmin() || (isNormalUser() && resource.data.userId == request.auth.uid);
-      
-      // السماح بالإضافة والتعديل: الأدمن والمدير مسموح لهم، والمستخدم لبياناته فقط
-      allow create, update: if isSuperAdmin() || isAdmin() || (isNormalUser() && request.resource.data.userId == request.auth.uid);
-      
-      // الحذف التلقائي لا يمكن إلا للأدمن أو المستخدم المالك للسجل
-      allow delete: if isSuperAdmin() || isAdmin() || (isNormalUser() && resource.data.userId == request.auth.uid);
+    const { email, password, name, role } = data;
+    
+    // 2. التحقق من الصلاحية المطلوبة (Admin أو User فقط)
+    if (!["admin", "user"].includes(role)) {
+        throw new functions.https.HttpsError("invalid-argument", "نوع الصلاحية غير صحيح.");
     }
 
-    // 2. قواعد مسارات بيانات المستخدمين وملفاتهم (User Profiles)
-    match /user_profiles/{userId} {
-      // فقط Super Admin يمكنه تعديل الملفات أو قراءتها بشكل كامل
-      allow read: if isSuperAdmin() || request.auth.uid == userId;
-      // يمنع نهائياً إنشاء أو تعديل المستخدمين من الواجهة الأمامية لأي شخص إلا الـ Super Admin
-      allow write: if isSuperAdmin();
+    try {
+        // 3. إنشاء حساب المستخدم في Authentication
+        const userRecord = await admin.auth().createUser({
+            email: email,
+            password: password,
+            displayName: name,
+        });
+
+        // 4. تعيين الصلاحيات (Custom Claims)
+        await admin.auth().setCustomUserClaims(userRecord.uid, { role: role });
+
+        // 5. حفظ الملف الشخصي في Firestore
+        await admin.firestore().collection("user_profiles").doc(userRecord.uid).set({
+            email: email,
+            name: name,
+            role: role,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            isActive: true
+        });
+
+        return { success: true, uid: userRecord.uid };
+    } catch (error) {
+        throw new functions.https.HttpsError("internal", error.message);
     }
-  }
-}
+});
+
+// دالة إيقاف حساب مستخدم
+exports.toggleUserStatus = functions.https.onCall(async (data, context) => {
+    if (!context.auth || context.auth.token.email !== SUPER_ADMIN_EMAIL) {
+        throw new functions.https.HttpsError("permission-denied", "غير مصرح لك.");
+    }
+
+    const { uid, disable } = data; // disable: true or false
+
+    try {
+        await admin.auth().updateUser(uid, { disabled: disable });
+        
+        // إبطال الجلسات الحالية (Revoke Tokens) عند الإيقاف
+        if (disable) {
+            await admin.auth().revokeRefreshTokens(uid);
+        }
+
+        await admin.firestore().collection("user_profiles").doc(uid).update({
+            isActive: !disable
+        });
+
+        return { success: true };
+    } catch (error) {
+        throw new functions.https.HttpsError("internal", error.message);
+    }
+});
